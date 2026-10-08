@@ -374,7 +374,7 @@ def build_plan(d15, d1h, d4h, d1d, fomo, fake, manip):
 FALLBACK_BASE = "https://data-api.binance.vision"
 
 
-def analyze(symbol, tz="Europe/Istanbul", base="https://api.binance.com", book=False, demo=False):
+def analyze_basic(symbol, tz="Europe/Istanbul", base="https://api.binance.com", book=False, demo=False):
     """Uygulama icin: tum analizi tek sozluk olarak dondurur."""
     sym = symbol.upper().strip()
     if demo:
@@ -405,7 +405,155 @@ def analyze(symbol, tz="Europe/Istanbul", base="https://api.binance.com", book=F
     return dict(symbol=sym, local_now=tr["local_now"], price=p["price"], funding=fr,
                 fomo=float(f), fomo_dir=fdir, fomo_why=fw,
                 fake=float(k), fake_why=kw, manip=float(m), manip_why=mw,
-                time=tr, plan=p)
+                time=tr, plan=p, _data=data, _base=base)
+
+
+def ticker24(symbol, base):
+    r = requests.get(f"{base}/api/v3/ticker/24hr", params={"symbol": symbol}, timeout=10).json()
+    return dict(price=float(r["lastPrice"]), chg=float(r["priceChangePercent"]),
+                qvol=float(r["quoteVolume"]))
+
+
+def mtf_summary(data):
+    rows = []
+    for tf in ("15m", "1h", "4h", "1d"):
+        c = data[tf].close
+        e20, e50 = ema(c, 20).iloc[-1], ema(c, 50).iloc[-1]
+        last = float(c.iloc[-1])
+        if last > e20 > e50:
+            tr = "YUKARI"
+        elif last < e20 < e50:
+            tr = "ASAGI"
+        else:
+            tr = "YATAY"
+        rows.append(dict(tf=tf, trend=tr, rsi=float(rsi(c).iloc[-1])))
+    return rows
+
+
+def candle_patterns(d):
+    """Son KAPANMIS muma gore basit formasyonlar."""
+    if len(d) < 2:
+        return []
+    p, c = d.iloc[-2], d.iloc[-1]
+    rng = c.high - c.low
+    out = []
+    if rng <= 0:
+        return out
+    body = abs(c.close - c.open)
+    uw = c.high - max(c.open, c.close)
+    lw = min(c.open, c.close) - c.low
+    if body < 0.1 * rng:
+        out.append("Doji (kararsizlik)")
+    if body > 0 and lw > 2 * body and uw < body:
+        out.append("Cekic (alici tepkisi)")
+    if body > 0 and uw > 2 * body and lw < body:
+        out.append("Kayan yildiz (satici tepkisi)")
+    if p.close > p.open and c.close < c.open and c.open >= p.close and c.close <= p.open:
+        out.append("Dususlu yutan mum (tepe uyarisi)")
+    if p.close < p.open and c.close > c.open and c.open <= p.close and c.close >= p.open:
+        out.append("Yukselisli yutan mum (dip uyarisi)")
+    return out
+
+
+def divergence(d):
+    d = d.tail(60)
+    r = rsi(d.close).values
+    h, l = d.high.values, d.low.values
+    w = 3
+    ph = [i for i in range(w, len(h) - w) if h[i] == h[i - w:i + w + 1].max()]
+    pl = [i for i in range(w, len(l) - w) if l[i] == l[i - w:i + w + 1].min()]
+    out = []
+    if len(ph) >= 2 and h[ph[-1]] > h[ph[-2]] and r[ph[-1]] < r[ph[-2]] - 3:
+        out.append("Negatif RSI uyumsuzlugu: fiyat yeni zirvede ama momentum zayif")
+    if len(pl) >= 2 and l[pl[-1]] < l[pl[-2]] and r[pl[-1]] > r[pl[-2]] + 3:
+        out.append("Pozitif RSI uyumsuzlugu: fiyat yeni dipte ama satis zayifliyor")
+    return out
+
+
+def momentum_plan(d1h, price, fomo, up, fake, manip, balance, risk_pct):
+    """FOMO/kovalama senaryosu: giris = anlik fiyat, stop yakin, R/R guncel fiyattan."""
+    if not up:
+        return dict(ok=False, note="Yukari momentum yok (fiyat dususte), kovalanacak bir hareket yok")
+    a = float(atr(d1h).iloc[-1])
+    swing = float(d1h.low.tail(6).min())
+    stop = min(max(swing - 0.3 * a, price - 2 * a), price - a)
+    risk = price - stop
+    t1, t2 = price + 1.5 * risk, price + 3 * risk
+    risk_amt = balance * risk_pct / 100.0
+    qty = risk_amt / risk
+    notional = qty * price
+    capped = False
+    if notional > balance:
+        notional, qty, capped = balance, balance / price, True
+        risk_amt = qty * risk
+    if manip >= 60 or fake >= 60:
+        v = "ONERILMEZ - manipulasyon / sahte hacim suphesi yuksek"
+    elif fomo >= 60:
+        v = "RISKLI - tepeden alim riski yuksek: kucuk pozisyon + siki stop"
+    else:
+        v = "UYGUN - trend yonunde devam senaryosu"
+    return dict(ok=True, entry=price, stop=stop, t1=t1, t2=t2, rr1=1.5, rr2=3.0,
+                risk_pct_price=risk / price * 100, qty=qty, notional=notional,
+                risk_amt=risk_amt, capped=capped, verdict=v,
+                trail="Fiyat hedef 1'e gelince stopu giris fiyatina cek, kalan kismi hedef 2 / izleyen stopla tasi")
+
+
+def analyze(symbol, tz="Europe/Istanbul", base="https://api.binance.com", book=False, demo=False,
+            balance=1000.0, risk_pct=1.0):
+    res = analyze_basic(symbol, tz, base, book, demo)
+    data = res.pop("_data")
+    b = res.pop("_base")
+    sym = res["symbol"]
+    warns = []
+    live = None
+    if not demo:
+        try:
+            live = ticker24(sym, b)
+        except Exception:
+            live = None
+    res["candle_price"] = res["price"]
+    if live:
+        res["price"] = live["price"]
+        if live["qvol"] < 1_000_000:
+            warns.append(f"24s hacim dusuk ({live['qvol'] / 1e6:.2f}M USDT): ince coin, "
+                         "manipulasyon ve kayma riski yuksek")
+        if live["chg"] >= 25:
+            warns.append(f"24s degisim +%{live['chg']:.0f}: asiri pump bolgesi")
+        elif live["chg"] <= -25:
+            warns.append(f"24s degisim %{live['chg']:.0f}: sert dusus / panik bolgesi")
+    res["ticker"] = live
+    res["mtf"] = mtf_summary(data)
+    closed = data["1h"].iloc[:-1]
+    res["patterns"] = candle_patterns(closed)
+    res["divergence"] = divergence(closed)
+    res["momentum"] = momentum_plan(data["1h"], res["price"], res["fomo"],
+                                    res["fomo_dir"].startswith("YUKARI"), res["fake"],
+                                    res["manip"], balance, risk_pct)
+    res["warnings"] = warns
+    res["data_time"] = data["1h"].index[-1].strftime("%d.%m %H:%M") + " UTC"
+    return res
+
+
+def scan(symbols, **kw):
+    out = []
+    for s in symbols:
+        s = s.strip()
+        if not s:
+            continue
+        try:
+            r = analyze(s, **kw)
+            out.append(dict(symbol=r["symbol"], price=r["price"], fomo=r["fomo"], fake=r["fake"],
+                            manip=r["manip"], bias=r["plan"]["bias"], verdict=r["plan"]["verdict"],
+                            mom=r["momentum"].get("verdict", "-")))
+        except Exception as e:
+            out.append(dict(symbol=s.upper(), error=str(e)))
+    return out
+
+
+def send_telegram(token, chat_id, text):
+    r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                      data={"chat_id": chat_id, "text": text}, timeout=10)
+    r.raise_for_status()
 
 
 def bar(x):

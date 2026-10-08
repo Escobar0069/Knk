@@ -5,6 +5,23 @@ import flet as ft
 
 import analyzer
 
+STRETCH = ft.CrossAxisAlignment.STRETCH
+
+
+def fmt(x):
+    if x is None:
+        return "-"
+    x = float(x)
+    if x >= 100:
+        return f"{x:,.2f}"
+    if x >= 1:
+        return f"{x:.4f}"
+    return f"{x:.6f}"
+
+
+def fmt_qty(q):
+    return f"{q:,.2f}" if q >= 1 else f"{q:.6f}"
+
 
 def score_color(v):
     if v < 35:
@@ -16,91 +33,152 @@ def score_color(v):
 
 def verdict_color(text):
     t = text.upper()
-    if t.startswith("GIRME"):
+    if t.startswith("GIRME") or t.startswith("ONERILMEZ"):
         return ft.Colors.RED
-    if t.startswith("BEKLE"):
+    if t.startswith("BEKLE") or t.startswith("RISKLI"):
         return ft.Colors.AMBER
-    if "GIRIS ADAYI" in t:
+    if "GIRIS ADAYI" in t or t.startswith("UYGUN"):
         return ft.Colors.GREEN
     return ft.Colors.BLUE
 
 
-def score_card(title, score, why, extra=""):
-    lines = [ft.Text("• " + w, size=13) for w in (why or ["belirgin sinyal yok"])]
+def trend_color(t):
+    return {"YUKARI": ft.Colors.GREEN, "ASAGI": ft.Colors.RED}.get(t, ft.Colors.GREY)
+
+
+def card(controls, bgcolor=None):
+    return ft.Card(
+        content=ft.Container(
+            padding=14,
+            bgcolor=bgcolor,
+            border_radius=10,
+            content=ft.Column(controls, spacing=6, horizontal_alignment=STRETCH),
+        )
+    )
+
+
+def title(text):
+    return ft.Text(text, weight=ft.FontWeight.BOLD, size=15)
+
+
+def line(text, color=None, size=13):
+    return ft.Text(text, size=size, color=color)
+
+
+def score_card(name, score, why, extra=""):
     head = ft.Row(
         [
-            ft.Text(title + extra, weight=ft.FontWeight.BOLD, size=15),
+            ft.Text(name + extra, weight=ft.FontWeight.BOLD, size=15),
             ft.Text(f"{score:.0f}/100", weight=ft.FontWeight.BOLD, color=score_color(score)),
         ],
         alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
     )
     bar = ft.ProgressBar(value=min(1.0, score / 100), color=score_color(score))
-    return ft.Card(content=ft.Container(padding=14, content=ft.Column([head, bar] + lines, spacing=8)))
+    lines = [line("• " + w) for w in (why or ["belirgin sinyal yok"])]
+    return card([head, bar] + lines)
+
+
+def verdict_card(label, text):
+    return card(
+        [
+            ft.Text(label, size=12, color=ft.Colors.BLACK),
+            ft.Text(text, size=16, weight=ft.FontWeight.BOLD, color=ft.Colors.BLACK),
+        ],
+        bgcolor=verdict_color(text),
+    )
 
 
 def build_result(res):
     p = res["plan"]
     t = res["time"]
-    ratio = t.get("vol_ratio")
-    ratio_txt = "-" if ratio is None or ratio != ratio else f"{ratio:.2f}x"
-    controls = []
+    m = res["momentum"]
+    tk = res.get("ticker")
+    out = []
 
-    controls.append(
-        ft.Card(
-            content=ft.Container(
-                padding=14,
-                bgcolor=verdict_color(p["verdict"]),
-                border_radius=10,
-                content=ft.Column(
-                    [
-                        ft.Text("KARAR", size=12, color=ft.Colors.BLACK),
-                        ft.Text(p["verdict"], size=17, weight=ft.FontWeight.BOLD, color=ft.Colors.BLACK),
-                    ],
-                    spacing=4,
-                ),
+    out.append(verdict_card("KARAR - geri çekilme planı", p["verdict"]))
+    if m.get("ok"):
+        out.append(verdict_card("KARAR - momentum (kovalama) planı", m["verdict"]))
+
+    head = f"{res['symbol']}  |  anlık {fmt(res['price'])}  |  veri {res.get('data_time', '-')}"
+    out.append(line(head, size=13))
+    if tk:
+        out.append(line(f"24s değişim %{tk['chg']:+.2f}  |  24s hacim {tk['qvol'] / 1e6:,.2f}M USDT", size=12))
+
+    if res.get("warnings"):
+        out.append(card([title("Uyarılar")] + [line("! " + w, ft.Colors.AMBER) for w in res["warnings"]]))
+
+    out.append(score_card("FOMO", res["fomo"], res["fomo_why"], f"  ({res['fomo_dir']})"))
+    out.append(score_card("Sahte hacim", res["fake"], res["fake_why"]))
+    out.append(score_card("Manipülasyon", res["manip"], res["manip_why"]))
+
+    mtf = [title("Zaman dilimleri")]
+    for r in res.get("mtf", []):
+        mtf.append(
+            ft.Row(
+                [
+                    ft.Text(r["tf"], size=13, width=50),
+                    ft.Text(r["trend"], size=13, color=trend_color(r["trend"]), width=80),
+                    ft.Text(f"RSI {r['rsi']:.0f}", size=13),
+                ]
             )
         )
-    )
+    out.append(card(mtf))
 
-    controls.append(
-        ft.Text(
-            f"{res['symbol']}  |  fiyat {p['price']:.4f}  |  saat {res['local_now']}",
-            size=13,
+    pat = res.get("patterns", []) + res.get("divergence", [])
+    out.append(card([title("Formasyon / uyumsuzluk (1s)")] + [line("• " + x) for x in (pat or ["belirgin formasyon yok"])]))
+
+    sup = ", ".join(fmt(l) for l, _ in p["supports"]) or "-"
+    rs = ", ".join(fmt(l) for l, _ in p["resistances"]) or "yok (fiyat zirvede)"
+    out.append(
+        card(
+            [
+                title("Geri çekilme planı"),
+                line(f"Trend: {p['bias']}  |  ATR(1s): {fmt(p['atr'])}"),
+                line(f"Giriş bölgesi: {fmt(p['zone'][0])} - {fmt(p['zone'][1])}"),
+                line(f"Stop: {fmt(p['stop'])}"),
+                line(f"Hedef 1 / 2: {fmt(p['targets'][0])} / {fmt(p['targets'][1])}"),
+                line(f"R/R (hedef 1): {p['rr']:.1f}  (giriş bölgesinden hesaplı)"),
+                line(f"15dk tetik: {'ONAYLI' if p['trigger'] else 'yok'}"),
+                line(f"Destek: {sup}"),
+                line(f"Direnç: {rs}"),
+            ]
         )
     )
 
-    controls.append(score_card("FOMO", res["fomo"], res["fomo_why"], f"  ({res['fomo_dir']})"))
-    controls.append(score_card("Sahte hacim", res["fake"], res["fake_why"]))
-    controls.append(score_card("Manipülasyon", res["manip"], res["manip_why"]))
+    if m.get("ok"):
+        cap = "  (bakiye ile sınırlandı)" if m["capped"] else ""
+        out.append(
+            card(
+                [
+                    title("Momentum planı (anlık fiyattan)"),
+                    line(f"Giriş: {fmt(m['entry'])}"),
+                    line(f"Stop: {fmt(m['stop'])}  (fiyatın %{m['risk_pct_price']:.1f} altı)"),
+                    line(f"Hedef 1 / 2: {fmt(m['t1'])} / {fmt(m['t2'])}"),
+                    line(f"R/R: {m['rr1']:.1f} / {m['rr2']:.1f}"),
+                    line(f"Pozisyon: {fmt_qty(m['qty'])} adet  ≈ {m['notional']:,.2f} USDT{cap}"),
+                    line(f"Stop olursa kayıp: ≈ {m['risk_amt']:,.2f} USDT"),
+                    line(m["trail"], size=12),
+                ]
+            )
+        )
+    else:
+        out.append(card([title("Momentum planı"), line(m.get("note", "-"))]))
 
-    sup = ", ".join(f"{l:.4f}" for l, _ in p["supports"]) or "-"
-    res_ = ", ".join(f"{l:.4f}" for l, _ in p["resistances"]) or "-"
-    plan_lines = [
-        ft.Text("Giriş planı", weight=ft.FontWeight.BOLD, size=15),
-        ft.Text(f"Trend: {p['bias']}  |  ATR(1s): {p['atr']:.4f}", size=13),
-        ft.Text(f"Giriş bölgesi: {p['zone'][0]:.4f} - {p['zone'][1]:.4f}", size=13),
-        ft.Text(f"Stop: {p['stop']:.4f}", size=13),
-        ft.Text(f"Hedef 1 / 2: {p['targets'][0]:.4f} / {p['targets'][1]:.4f}", size=13),
-        ft.Text(f"R/R (hedef 1): {p['rr']:.1f}", size=13),
-        ft.Text(f"15dk tetik: {'ONAYLI' if p['trigger'] else 'yok'}", size=13),
-        ft.Text(f"Destek: {sup}", size=13),
-        ft.Text(f"Direnç: {res_}", size=13),
-    ]
-    controls.append(ft.Card(content=ft.Container(padding=14, content=ft.Column(plan_lines, spacing=6))))
-
-    nxt = "; ".join(f"{n} {tm} ({int(m)} dk)" for m, n, tm in t["next"])
+    ratio = t.get("vol_ratio")
+    ratio_txt = "-" if ratio is None or ratio != ratio else f"{ratio:.2f}x"
+    nxt = "; ".join(f"{n} {tm} ({int(mi)} dk)" for mi, n, tm in t["next"])
     hot = ", ".join(f"{h} (%{r:.2f})" for h, r, _ in t["hot"])
-    time_lines = [
-        ft.Text("Kritik saatler", weight=ft.FontWeight.BOLD, size=15),
-        ft.Text(f"Seans: {', '.join(t['sessions'])}  |  hacim/normal: {ratio_txt}", size=13),
-        ft.Text(f"En oynak saatler: {hot}", size=13),
-        ft.Text(f"Sıradaki: {nxt}", size=13),
+    tl = [
+        title("Kritik saatler"),
+        line(f"Seans: {', '.join(t['sessions'])}  |  hacim/normal: {ratio_txt}"),
+        line(f"En oynak saatler: {hot}"),
+        line(f"Sıradaki: {nxt}"),
     ]
     for w in t["warns"]:
-        time_lines.append(ft.Text("! " + w, size=13, color=ft.Colors.AMBER))
-    controls.append(ft.Card(content=ft.Container(padding=14, content=ft.Column(time_lines, spacing=6))))
+        tl.append(line("! " + w, ft.Colors.AMBER))
+    out.append(card(tl))
 
-    controls.append(
+    out.append(
         ft.Text(
             "Yalnızca analizdir, yatırım tavsiyesi değildir. Skorlar olasılıksal sezgilerdir; "
             "kesin manipülasyon kanıtı değildir. Her zaman stop kullan.",
@@ -108,17 +186,60 @@ def build_result(res):
             italic=True,
         )
     )
-    return controls
+    return out
+
+
+def build_scan(rows):
+    out = []
+    for r in rows:
+        if "error" in r:
+            out.append(card([title(r["symbol"]), line("Hata: " + r["error"], ft.Colors.RED)]))
+            continue
+        out.append(
+            card(
+                [
+                    ft.Row(
+                        [title(r["symbol"]), line(fmt(r["price"]))],
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                    ),
+                    line(f"FOMO {r['fomo']:.0f}  |  Sahte {r['fake']:.0f}  |  Manip. {r['manip']:.0f}  |  {r['bias']}"),
+                    line(r["verdict"], verdict_color(r["verdict"])),
+                    line("Momentum: " + r["mom"], verdict_color(r["mom"]), size=12),
+                ]
+            )
+        )
+    return out
 
 
 def main(page: ft.Page):
     page.title = "Kripto Analiz"
     page.theme_mode = ft.ThemeMode.DARK
     page.scroll = ft.ScrollMode.AUTO
-    page.padding = 12
+    page.padding = ft.padding.only(left=12, right=12, top=40, bottom=16)
 
-    symbol = ft.TextField(label="Sembol", value="BTCUSDT", expand=True)
+    def load(key, default):
+        try:
+            v = page.client_storage.get(key)
+            return default if v is None else v
+        except Exception:
+            return default
+
+    def save(key, value):
+        try:
+            page.client_storage.set(key, value)
+        except Exception:
+            pass
+
+    symbol = ft.TextField(label="Sembol", value=load("symbol", "BTCUSDT"), expand=True)
     go = ft.ElevatedButton("Analiz et")
+    balance = ft.TextField(
+        label="Bakiye (USDT)", value=str(load("balance", "1000")), expand=True,
+        keyboard_type=ft.KeyboardType.NUMBER,
+    )
+    risk = ft.TextField(
+        label="Risk %", value=str(load("risk", "1")), expand=True,
+        keyboard_type=ft.KeyboardType.NUMBER,
+    )
     book = ft.Switch(label="Emir defteri kontrolü (+4 sn)", value=False)
     demo = ft.Switch(label="Demo veri", value=False)
     auto = ft.Dropdown(
@@ -131,33 +252,108 @@ def main(page: ft.Page):
             ft.dropdown.Option("900", "15 dk"),
         ],
     )
+    watch = ft.TextField(
+        label="Tarama listesi (virgülle)", value=load("watch", "BTCUSDT,ETHUSDT,SOLUSDT"),
+    )
+    scan_btn = ft.ElevatedButton("Listeyi tara")
+    tg_token = ft.TextField(label="Telegram bot token", value=load("tg_token", ""), password=True,
+                            can_reveal_password=True)
+    tg_chat = ft.TextField(label="Telegram chat id", value=load("tg_chat", ""))
+    tg_on = ft.Switch(label="Karar değişince Telegram'a yaz", value=False)
+    settings = ft.ExpansionTile(
+        title=ft.Text("Bildirim ayarları"),
+        controls=[tg_token, tg_chat, tg_on],
+    )
+
     status = ft.Text("", size=12)
     progress = ft.ProgressRing(visible=False, width=22, height=22)
-    result = ft.Column(spacing=8)
-    state = {"busy": False, "last": 0.0}
+    result = ft.Column(spacing=8, horizontal_alignment=STRETCH)
+    state = {"busy": False, "last": 0.0, "verdicts": {}}
+
+    def num(tf, default):
+        try:
+            return float(str(tf.value).replace(",", "."))
+        except Exception:
+            return default
+
+    def begin(msg):
+        state["busy"] = True
+        go.disabled = True
+        scan_btn.disabled = True
+        progress.visible = True
+        status.value = msg
+        page.update()
+
+    def end():
+        state["busy"] = False
+        state["last"] = time.time()
+        go.disabled = False
+        scan_btn.disabled = False
+        progress.visible = False
+        page.update()
+
+    def notify(res):
+        if not (tg_on.value and tg_token.value and tg_chat.value):
+            return
+        sym = res["symbol"]
+        v = res["plan"]["verdict"]
+        prev = state["verdicts"].get(sym)
+        state["verdicts"][sym] = v
+        if prev is not None and prev != v:
+            text = (
+                f"{sym} {fmt(res['price'])}\n"
+                f"{v}\nMomentum: {res['momentum'].get('verdict', '-')}\n"
+                f"FOMO {res['fomo']:.0f} | Sahte {res['fake']:.0f} | Manip {res['manip']:.0f}"
+            )
+            try:
+                analyzer.send_telegram(tg_token.value.strip(), tg_chat.value.strip(), text)
+            except Exception as ex:
+                status.value = f"Telegram hatası: {ex}"
 
     def do_analysis(e=None):
         if state["busy"]:
             return
-        state["busy"] = True
-        go.disabled = True
-        progress.visible = True
-        status.value = "Veri çekiliyor..."
-        page.update()
+        begin("Veri çekiliyor...")
         try:
-            res = analyzer.analyze(symbol.value, book=book.value, demo=demo.value)
+            save("symbol", symbol.value)
+            save("balance", balance.value)
+            save("risk", risk.value)
+            save("tg_token", tg_token.value)
+            save("tg_chat", tg_chat.value)
+            res = analyzer.analyze(
+                symbol.value,
+                book=book.value,
+                demo=demo.value,
+                balance=num(balance, 1000.0),
+                risk_pct=num(risk, 1.0),
+            )
             result.controls = build_result(res)
             status.value = f"Güncellendi: {res['local_now']}"
+            notify(res)
         except Exception as ex:
             status.value = f"Hata: {ex}"
         finally:
-            state["busy"] = False
-            state["last"] = time.time()
-            go.disabled = False
-            progress.visible = False
-            page.update()
+            end()
+
+    def do_scan(e=None):
+        if state["busy"]:
+            return
+        begin("Liste taranıyor...")
+        try:
+            save("watch", watch.value)
+            syms = [s for s in watch.value.replace(" ", "").split(",") if s]
+            rows = analyzer.scan(
+                syms, demo=demo.value, balance=num(balance, 1000.0), risk_pct=num(risk, 1.0)
+            )
+            result.controls = build_scan(rows)
+            status.value = f"{len(rows)} coin tarandı"
+        except Exception as ex:
+            status.value = f"Hata: {ex}"
+        finally:
+            end()
 
     go.on_click = do_analysis
+    scan_btn.on_click = do_scan
 
     def loop():
         while True:
@@ -173,10 +369,14 @@ def main(page: ft.Page):
 
     page.add(
         ft.Row([symbol, go]),
+        ft.Row([balance, risk]),
         ft.Row([progress, status]),
         book,
         demo,
         auto,
+        watch,
+        scan_btn,
+        settings,
         result,
     )
 
