@@ -1,0 +1,17 @@
+[project]
+name = "kripto-analiz"
+version = "1.0.0"
+description = "Kripto grafik analiz botu"
+requires-python = ">=3.10"
+dependencies = [
+  "flet==0.28.3",
+  "pandas",
+  "numpy",
+  "requests",
+  "tzdata",
+]
+
+[tool.flet]
+org = "com.onurnoyan"
+product = "Kripto Analiz"
+company = "Onur"
